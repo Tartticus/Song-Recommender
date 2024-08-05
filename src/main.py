@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import requests
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from bs4 import BeautifulSoup
@@ -7,12 +7,29 @@ import re
 import os
 import threading
 import nltk
+import duckdb
+
 # Initialize Sentiment Analyzer
 nltk.download('vader_lexicon')
 sid = SentimentIntensityAnalyzer()
 
 # Replace with your Genius API token
 GENIUS_API_TOKEN = 'zMs-ogdbxt0F5CzmO52iLZ9A3jgj3ZZQWvNTNyTSm05x7z7yaLgWSlJFMa7cX92f'
+
+# Initialize DuckDB connection
+con = duckdb.connect(database='lyrics.db')  # Use a persistent DuckDB database file
+con.execute('''
+    CREATE TABLE IF NOT EXISTS lyrics (
+        artist TEXT,
+        title TEXT,
+        lyrics TEXT,
+        sentiment_score REAL
+    )
+''')
+
+def normalize_text(text):
+    text = re.sub(r'[^a-zA-Z0-9 ]', '', text)
+    return text.lower()
 
 def analyze_sentiment(text):
     sentiment_score = sid.polarity_scores(text)
@@ -52,7 +69,7 @@ def request_song_url(artist_name, song_cap):
         for hit in json['response']['hits']:
             if artist_name.lower() in hit['result']['primary_artist']['name'].lower():
                 song_info.append(hit)
-    
+                
         for song in song_info:
             if len(songs) < song_cap:
                 url = song['result']['url']
@@ -81,15 +98,35 @@ def scrape_song_lyrics(url):
     lyrics = os.linesep.join([s for s in lyrics.splitlines() if s])  # Remove empty lines
     return lyrics
 
+def store_lyrics_in_db(artist, title, lyrics, sentiment_score):
+    artist = normalize_text(artist)
+    con.execute('''
+        INSERT INTO lyrics (artist, title, lyrics, sentiment_score)
+        VALUES (?, ?, ?, ?)
+    ''', (artist, title, lyrics, sentiment_score))
+
+def get_lyrics_from_db(artist_name):
+    artist_name = normalize_text(artist_name)
+    result = con.execute('''
+        SELECT title, lyrics, sentiment_score FROM lyrics
+        WHERE artist = ?
+    ''', (artist_name,)).fetchall()
+    return result
+
 def scrape_lyrics(artist_name, song_cap):
-    songs = request_song_url(artist_name, song_cap)
+    db_lyrics = get_lyrics_from_db(artist_name)
     
-    song_lyrics = {}
-    for url in songs:
-        title = url.split("/")[-1].replace("-lyrics", "").replace("-", " ").title()
-        title_key = f"{title}"
-        lyrics = scrape_song_lyrics(url)
-        song_lyrics[title_key] = lyrics
+    if db_lyrics:
+        song_lyrics = {title: {'text': lyrics, 'sentiment_scores': {'compound': sentiment_score}} for title, lyrics, sentiment_score in db_lyrics}
+    else:
+        songs = request_song_url(artist_name, song_cap)
+        song_lyrics = {}
+        for url in songs:
+            title = url.split("/")[-1].replace("-lyrics", "").replace("-", " ").title()
+            lyrics = scrape_song_lyrics(url)
+            sentiment_score = analyze_sentiment(lyrics)
+            song_lyrics[title] = {'text': lyrics, 'sentiment_scores': {'compound': sentiment_score}}
+            store_lyrics_in_db(artist_name, title, lyrics, sentiment_score)
     
     return song_lyrics
 
@@ -100,14 +137,14 @@ def recommend_song():
     user_sentiment_text = mood_entry.get()
     user_sentiment_score = analyze_sentiment(user_sentiment_text)
     artist_name = artist_entry.get()
-    song_cap = 50
+    song_cap = 100
     
     try:
         Lyrics = scrape_lyrics(artist_name, song_cap)
         for key, text in Lyrics.items():
-            scores = sid.polarity_scores(text)
+            scores = text['sentiment_scores']
             Lyrics[key] = {
-                'text': text,
+                'text': text['text'],
                 'sentiment_scores': scores,
                 'sentiment_label': 'positive' if scores['compound'] > 0 else 'negative' if scores['compound'] < 0 else 'neutral'
             }
@@ -141,8 +178,6 @@ mood_entry.grid(row=0, column=1, pady=5)
 ttk.Label(frame, text="Who do you want to listen to?:").grid(row=1, column=0, sticky=tk.W, pady=5)
 artist_entry = ttk.Entry(frame, width=50)
 artist_entry.grid(row=1, column=1, pady=5)
-
-
 
 ttk.Button(frame, text='Get Recommendation', command=start_recommendation_thread).grid(row=3, column=1, pady=20)
 
